@@ -170,6 +170,14 @@ pub fn get_registry() -> &'static Mutex<LocalModelRegistry> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardFile {
+    pub filename: String,
+    pub local_path: PathBuf,
+    pub source_url: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalModelEntry {
     pub id: String,
     pub repo_id: String,
@@ -181,11 +189,18 @@ pub struct LocalModelEntry {
     pub settings: ModelSettings,
     #[serde(default)]
     pub size_bytes: u64,
+    #[serde(default)]
+    pub shard_files: Vec<ShardFile>,
 }
 
 impl LocalModelEntry {
     pub fn is_downloaded(&self) -> bool {
-        self.local_path.exists()
+        self.local_path.exists() && self.shard_files.iter().all(|s| s.local_path.exists())
+    }
+
+    pub fn all_local_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        std::iter::once(self.local_path.as_path())
+            .chain(self.shard_files.iter().map(|s| s.local_path.as_path()))
     }
 
     pub fn is_downloading(&self) -> bool {
@@ -195,7 +210,7 @@ impl LocalModelEntry {
     }
 
     pub fn download_status(&self) -> ModelDownloadStatus {
-        if self.local_path.exists() {
+        if self.is_downloaded() {
             return ModelDownloadStatus::Downloaded;
         }
 

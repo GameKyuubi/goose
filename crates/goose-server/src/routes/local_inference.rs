@@ -11,10 +11,10 @@ use goose::download_manager::{get_download_manager, DownloadProgress};
 use goose::providers::local_inference::hf_models::{self, HfModelInfo, HfQuantVariant};
 use goose::providers::local_inference::{
     available_inference_memory_bytes,
-    hf_models::{resolve_model_spec, HfGgufFile},
+    hf_models::{resolve_model_spec, resolve_model_spec_full, HfGgufFile},
     local_model_registry::{
         default_settings_for_model, get_registry, is_featured_model, model_id_from_repo,
-        LocalModelEntry, ModelDownloadStatus as RegistryDownloadStatus, ModelSettings,
+        LocalModelEntry, ModelDownloadStatus as RegistryDownloadStatus, ModelSettings, ShardFile,
         FEATURED_MODELS,
     },
     recommend_local_model,
@@ -100,6 +100,7 @@ async fn ensure_featured_models_in_registry() -> Result<(), ErrorResponse> {
             source_url: hf_file.download_url,
             settings: default_settings_for_model(&model_id),
             size_bytes: hf_file.size_bytes,
+            shard_files: vec![],
         });
     }
 
@@ -275,23 +276,41 @@ pub async fn download_hf_model(
     let (repo_id, quantization) = hf_models::parse_model_spec(&req.spec)
         .map_err(|e| ErrorResponse::bad_request(format!("Invalid spec format: {e}")))?;
 
-    let (_repo, hf_file) = resolve_model_spec(&req.spec)
+    let (_repo, resolved) = resolve_model_spec_full(&req.spec)
         .await
         .map_err(|e| ErrorResponse::bad_request(format!("Invalid spec: {}", e)))?;
 
     let model_id = model_id_from_repo(&repo_id, &quantization);
-    let local_path = Paths::in_data_dir("models").join(&hf_file.filename);
-    let download_url = hf_file.download_url.clone();
+    let models_dir = Paths::in_data_dir("models");
+    let first_file = &resolved.files[0];
+    let first_local_path = models_dir.join(&first_file.filename);
+
+    let shard_files: Vec<ShardFile> = if resolved.files.len() > 1 {
+        resolved
+            .files
+            .iter()
+            .skip(1)
+            .map(|f| ShardFile {
+                filename: f.filename.clone(),
+                local_path: models_dir.join(&f.filename),
+                source_url: f.download_url.clone(),
+                size_bytes: f.size_bytes,
+            })
+            .collect()
+    } else {
+        vec![]
+    };
 
     let entry = LocalModelEntry {
         id: model_id.clone(),
         repo_id,
-        filename: hf_file.filename,
+        filename: first_file.filename.clone(),
         quantization,
-        local_path: local_path.clone(),
-        source_url: download_url.clone(),
+        local_path: first_local_path.clone(),
+        source_url: first_file.download_url.clone(),
         settings: default_settings_for_model(&model_id),
-        size_bytes: hf_file.size_bytes,
+        size_bytes: resolved.total_size,
+        shard_files: shard_files.clone(),
     };
 
     {
@@ -304,10 +323,16 @@ pub async fn download_hf_model(
     }
 
     let dm = get_download_manager();
-    dm.download_model(
+    let all_files: Vec<(String, std::path::PathBuf)> = resolved
+        .files
+        .iter()
+        .map(|f| (f.download_url.clone(), models_dir.join(&f.filename)))
+        .collect();
+
+    dm.download_model_sharded(
         format!("{}-model", model_id),
-        download_url,
-        local_path,
+        all_files,
+        resolved.total_size,
         None,
     )
     .await
@@ -367,20 +392,33 @@ pub async fn cancel_local_model_download(
     )
 )]
 pub async fn delete_local_model(Path(model_id): Path<String>) -> Result<StatusCode, ErrorResponse> {
-    let local_path = {
+    let (all_paths, primary_path) = {
         let registry = get_registry()
             .lock()
             .map_err(|_| ErrorResponse::internal("Failed to acquire registry lock"))?;
         let entry = registry
             .get_model(&model_id)
             .ok_or_else(|| ErrorResponse::not_found("Model not found"))?;
-        entry.local_path.clone()
+        let paths: Vec<std::path::PathBuf> =
+            entry.all_local_paths().map(|p| p.to_path_buf()).collect();
+        let primary = entry.local_path.clone();
+        (paths, primary)
     };
 
-    if local_path.exists() {
-        tokio::fs::remove_file(&local_path)
-            .await
-            .map_err(|e| ErrorResponse::internal(format!("Failed to delete: {}", e)))?;
+    for path in &all_paths {
+        if path.exists() {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(|e| ErrorResponse::internal(format!("Failed to delete: {}", e)))?;
+        }
+    }
+
+    // Clean up empty parent directories (e.g. BF16/ subdirectory)
+    if let Some(parent) = primary_path.parent() {
+        let models_dir = Paths::in_data_dir("models");
+        if parent != models_dir {
+            let _ = tokio::fs::remove_dir(parent).await;
+        }
     }
 
     // Only remove non-featured models from registry (featured ones stay as placeholders)

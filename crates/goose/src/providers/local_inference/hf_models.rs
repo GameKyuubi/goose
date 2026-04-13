@@ -33,6 +33,15 @@ pub struct HfQuantVariant {
     pub download_url: String,
     pub description: &'static str,
     pub quality_rank: u8,
+    #[serde(default)]
+    pub sharded: bool,
+}
+
+/// Result of resolving a model spec — may contain multiple shard files.
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    pub files: Vec<HfGgufFile>,
+    pub total_size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,13 +277,30 @@ fn group_into_variants(repo_id: &str, files: Vec<HfApiSibling>) -> Vec<HfQuantVa
             download_url,
             description: info.description,
             quality_rank: info.quality_rank,
+            sharded: false,
         });
     }
 
-    // TODO: Once the download path supports fetching all shards for a
-    // quantization, expose shard-only variants here. For now we only show
-    // quants that have a single-file download available.
-    let _ = shard_groups;
+    // Add shard-only variants (quants that only exist as sharded files)
+    for (quant, mut shards) in shard_groups {
+        if seen_quants.contains(&quant) {
+            continue;
+        }
+        shards.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
+        let total_size: u64 = shards.iter().map(|s| s.size.unwrap_or(0)).sum();
+        let info = quant_info(&quant);
+        let first_filename = &shards[0].rfilename;
+        let download_url = build_download_url(repo_id, first_filename);
+        variants.push(HfQuantVariant {
+            quantization: quant,
+            size_bytes: total_size,
+            filename: first_filename.clone(),
+            download_url,
+            description: info.description,
+            quality_rank: info.quality_rank,
+            sharded: true,
+        });
+    }
 
     // Sort descending by quality_rank, then by size descending as tiebreaker
     variants.sort_by(|a, b| {
@@ -434,23 +460,104 @@ pub fn parse_model_spec(spec: &str) -> Result<(String, String)> {
     Ok((repo_id.to_string(), quant.to_string()))
 }
 
+/// Resolve a model spec to all GGUF files for that quantization (handles shards).
+pub async fn resolve_model_spec_full(spec: &str) -> Result<(String, ResolvedModel)> {
+    let (repo_id, quant) = parse_model_spec(spec)?;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/{}?blobs=true", HF_API_BASE, repo_id);
+    let response = client
+        .get(&url)
+        .header("User-Agent", "goose-ai-agent")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        bail!(
+            "HuggingFace API returned status {} for repo {}",
+            response.status(),
+            repo_id
+        );
+    }
+
+    let model: HfApiModel = response.json().await?;
+    let siblings = model.siblings.unwrap_or_default();
+    let stem = model_stem_from_repo(&repo_id);
+
+    // Collect all GGUF files matching the quantization
+    let matching: Vec<_> = siblings
+        .into_iter()
+        .filter(|s| {
+            s.rfilename.ends_with(".gguf")
+                && is_model_file(&s.rfilename, &stem)
+                && parse_quantization(&s.rfilename).eq_ignore_ascii_case(&quant)
+        })
+        .collect();
+
+    if matching.is_empty() {
+        bail!(
+            "No GGUF file with quantization '{}' found in {}",
+            quant,
+            repo_id
+        );
+    }
+
+    // Separate single files from shards
+    let mut single_files: Vec<&HfApiSibling> = Vec::new();
+    let mut shard_files: Vec<&HfApiSibling> = Vec::new();
+    for f in &matching {
+        if is_shard_file(&f.rfilename) {
+            shard_files.push(f);
+        } else {
+            single_files.push(f);
+        }
+    }
+
+    // Prefer single file if available
+    if let Some(single) = single_files.first() {
+        let file = HfGgufFile {
+            filename: single.rfilename.clone(),
+            size_bytes: single.size.unwrap_or(0),
+            quantization: quant,
+            download_url: build_download_url(&repo_id, &single.rfilename),
+        };
+        let total_size = file.size_bytes;
+        return Ok((
+            repo_id,
+            ResolvedModel {
+                files: vec![file],
+                total_size,
+            },
+        ));
+    }
+
+    // Use shards, sorted by filename so shard 1 is first
+    shard_files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
+    let files: Vec<HfGgufFile> = shard_files
+        .iter()
+        .map(|s| HfGgufFile {
+            filename: s.rfilename.clone(),
+            size_bytes: s.size.unwrap_or(0),
+            quantization: quant.clone(),
+            download_url: build_download_url(&repo_id, &s.rfilename),
+        })
+        .collect();
+    let total_size: u64 = files.iter().map(|f| f.size_bytes).sum();
+
+    Ok((repo_id, ResolvedModel { files, total_size }))
+}
+
 /// Resolve a model spec to a specific GGUF file from the repo.
 pub async fn resolve_model_spec(spec: &str) -> Result<(String, HfGgufFile)> {
-    let (repo_id, quant) = parse_model_spec(spec)?;
-    let files = get_repo_gguf_files(&repo_id).await?;
-
-    let file = files
-        .into_iter()
-        .find(|f| f.quantization.eq_ignore_ascii_case(&quant))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No GGUF file with quantization '{}' found in {}",
-                quant,
-                repo_id
-            )
-        })?;
-
-    Ok((repo_id, file))
+    let (repo_id, resolved) = resolve_model_spec_full(spec).await?;
+    if resolved.files.len() > 1 {
+        bail!(
+            "Model '{}' is sharded ({} files) — use resolve_model_spec_full instead",
+            spec,
+            resolved.files.len()
+        );
+    }
+    Ok((repo_id, resolved.files.into_iter().next().unwrap()))
 }
 
 /// Recommend which quantization variant to use based on available memory.
@@ -536,6 +643,7 @@ mod tests {
                 download_url: String::new(),
                 description: "Small",
                 quality_rank: 24,
+                sharded: false,
             },
             HfQuantVariant {
                 quantization: "Q4_K_M".into(),
@@ -544,6 +652,7 @@ mod tests {
                 download_url: String::new(),
                 description: "Medium",
                 quality_rank: 45,
+                sharded: false,
             },
             HfQuantVariant {
                 quantization: "Q8_0".into(),
@@ -552,6 +661,7 @@ mod tests {
                 download_url: String::new(),
                 description: "Large",
                 quality_rank: 80,
+                sharded: false,
             },
         ];
 
@@ -603,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_into_variants_excludes_shard_only_quants() {
+    fn test_group_into_variants_includes_shard_only_quants() {
         let files = vec![
             HfApiSibling {
                 rfilename: "BF16/gemma-3-27b-it-BF16-00001-of-00002.gguf".into(),
@@ -619,10 +729,13 @@ mod tests {
             },
         ];
         let variants = group_into_variants("unsloth/gemma-3-27b-it-GGUF", files);
-        // BF16 only exists as shards, so it should be excluded until
-        // the download path supports fetching multiple shard files.
-        assert_eq!(variants.len(), 1);
-        assert_eq!(variants[0].quantization, "Q4_K_M");
+        assert_eq!(variants.len(), 2);
+        // Sorted descending by quality_rank: BF16 (91) > Q4_K_M (45)
+        assert_eq!(variants[0].quantization, "BF16");
+        assert!(variants[0].sharded);
+        assert_eq!(variants[0].size_bytes, 50_000_000_000);
+        assert_eq!(variants[1].quantization, "Q4_K_M");
+        assert!(!variants[1].sharded);
     }
 
     #[test]
