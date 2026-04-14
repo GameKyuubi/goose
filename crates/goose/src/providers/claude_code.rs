@@ -5,7 +5,7 @@ use futures::future::BoxFuture;
 use rmcp::model::{Role, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -21,7 +21,9 @@ use super::base::{
 };
 use super::errors::ProviderError;
 use super::utils::filter_extensions_from_system_prompt;
+use crate::agents::extension::PLATFORM_EXTENSIONS;
 use crate::config::base::ClaudeCodeCommand;
+use crate::config::extensions::name_to_key;
 use crate::config::paths::Paths;
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, ExtensionConfig, GooseMode};
@@ -266,7 +268,7 @@ pub struct ClaudeCodeProvider {
     #[serde(skip)]
     mcp_config_file: Option<NamedTempFile>,
     #[serde(skip)]
-    cli_process: tokio::sync::OnceCell<Arc<tokio::sync::Mutex<CliProcess>>>,
+    cli_processes: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<CliProcess>>>>>,
     #[serde(skip)]
     pending_confirmations:
         Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<PermissionConfirmation>>>>,
@@ -428,15 +430,22 @@ impl ClaudeCodeProvider {
 
     async fn get_or_init_process(
         &self,
+        session_id: &str,
         filtered_system: &str,
-    ) -> Result<&Arc<tokio::sync::Mutex<CliProcess>>, ProviderError> {
-        self.cli_process
-            .get_or_try_init(|| async {
-                Ok(Arc::new(tokio::sync::Mutex::new(
+    ) -> Result<Arc<tokio::sync::Mutex<CliProcess>>, ProviderError> {
+        // Hard isolation: one persistent Claude CLI subprocess per session_id.
+        // This prevents conversation/path/model bleed across sessions.
+        let mut map = self.cli_processes.lock().await;
+        match map.entry(session_id.to_string()) {
+            Entry::Occupied(existing) => Ok(Arc::clone(existing.get())),
+            Entry::Vacant(vacant) => {
+                let process = Arc::new(tokio::sync::Mutex::new(
                     self.spawn_process(filtered_system).await?,
-                )))
-            })
-            .await
+                ));
+                vacant.insert(Arc::clone(&process));
+                Ok(process)
+            }
+        }
     }
 }
 
@@ -517,7 +526,7 @@ fn build_stream_json_input(content_blocks: &[Value], session_id: &str) -> String
     serde_json::to_string(&msg).expect("serializing JSON content blocks cannot fail")
 }
 
-fn claude_mcp_config_json(extensions: &[ExtensionConfig]) -> Option<String> {
+fn claude_mcp_config_json(extensions: &[ExtensionConfig], goose_exe: &Path) -> Option<String> {
     let mut mcp_servers = serde_json::Map::new();
 
     for extension in extensions {
@@ -547,6 +556,20 @@ fn claude_mcp_config_json(extensions: &[ExtensionConfig]) -> Option<String> {
                     config.insert("env".to_string(), json!(env_map));
                 }
                 mcp_servers.insert(key, Value::Object(config));
+            }
+            ExtensionConfig::Builtin { name, .. } => {
+                let normalized = name_to_key(name);
+                // Platform extensions run in-process and can't be served standalone.
+                // True builtin MCP servers (autovisualiser, etc.) can be launched
+                // via `goose mcp <name>` as stdio servers.
+                if !PLATFORM_EXTENSIONS.contains_key(normalized.as_str()) {
+                    let key = extension.key();
+                    let mut config = serde_json::Map::new();
+                    config.insert("type".to_string(), json!("stdio"));
+                    config.insert("command".to_string(), json!(goose_exe));
+                    config.insert("args".to_string(), json!(["mcp", &normalized]));
+                    mcp_servers.insert(key, Value::Object(config));
+                }
             }
             ExtensionConfig::Sse { name, .. } => {
                 tracing::debug!(name, "skipping SSE extension, migrate to streamable_http");
@@ -614,7 +637,8 @@ impl ProviderDef for ClaudeCodeProvider {
                 resolved.push(ext.resolve(config).await?);
             }
 
-            let mcp_config_file = claude_mcp_config_json(&resolved)
+            let goose_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("goose"));
+            let mcp_config_file = claude_mcp_config_json(&resolved, &goose_exe)
                 .map(|json| write_mcp_config_file(&Paths::state_dir(), &json))
                 .transpose()?;
 
@@ -623,7 +647,7 @@ impl ProviderDef for ClaudeCodeProvider {
                 model,
                 name: CLAUDE_CODE_PROVIDER_NAME.to_string(),
                 mcp_config_file,
-                cli_process: tokio::sync::OnceCell::new(),
+                cli_processes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 pending_confirmations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 initial_mode: tokio::sync::Mutex::new(None),
             })
@@ -723,7 +747,9 @@ impl Provider for ClaudeCodeProvider {
         }
 
         let filtered_system = filter_extensions_from_system_prompt(system);
-        let process_arc = Arc::clone(self.get_or_init_process(&filtered_system).await?);
+        let process_arc = self
+            .get_or_init_process(session_id, &filtered_system)
+            .await?;
 
         // Prepare the payload outside the lock — these don't need the process.
         let blocks = self.last_user_content_blocks(messages);
@@ -1181,8 +1207,39 @@ mod tests {
         }}))
         ; "resolved_name_used_as_key"
     )]
+    #[test_case(
+        vec![ExtensionConfig::Builtin {
+            name: "autovisualiser".into(),
+            description: String::new(),
+            display_name: Some("Auto Visualiser".into()),
+            timeout: Some(300),
+            bundled: Some(true),
+            available_tools: vec![],
+        }],
+        Some(json!({ "mcpServers": {
+            "autovisualiser": {
+                "type": "stdio",
+                "command": "/usr/bin/goose",
+                "args": ["mcp", "autovisualiser"]
+            }
+        }}))
+        ; "builtin_converts_to_goose_mcp_stdio"
+    )]
+    #[test_case(
+        vec![ExtensionConfig::Builtin {
+            name: "developer".into(),
+            description: String::new(),
+            display_name: Some("Developer".into()),
+            timeout: None,
+            bundled: Some(true),
+            available_tools: vec![],
+        }],
+        None
+        ; "platform_extension_as_builtin_skipped"
+    )]
     fn test_claude_mcp_config_json(extensions: Vec<ExtensionConfig>, expected: Option<Value>) {
-        let result = claude_mcp_config_json(&extensions)
+        let dummy_exe = Path::new("/usr/bin/goose");
+        let result = claude_mcp_config_json(&extensions, dummy_exe)
             .map(|json| serde_json::from_str::<Value>(&json).unwrap());
         assert_eq!(result, expected);
     }
@@ -1215,7 +1272,7 @@ mod tests {
                 .with_canonical_limits(CLAUDE_CODE_PROVIDER_NAME),
             name: "claude-code".to_string(),
             mcp_config_file: None,
-            cli_process: tokio::sync::OnceCell::new(),
+            cli_processes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_confirmations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             initial_mode: tokio::sync::Mutex::new(None),
         }
@@ -1248,7 +1305,11 @@ mod tests {
         let (process, stdin_reader) = make_test_process(&canned_stdout);
         let provider = make_provider();
         let process_arc = Arc::new(tokio::sync::Mutex::new(process));
-        provider.cli_process.set(process_arc).unwrap();
+        provider
+            .cli_processes
+            .lock()
+            .await
+            .insert("test-session".to_string(), process_arc);
 
         let messages = vec![Message::user().with_text("test")];
         let stream = provider
@@ -1263,7 +1324,9 @@ mod tests {
         mut reader: tokio::io::DuplexStream,
     ) -> String {
         use tokio::io::AsyncReadExt;
-        provider.cli_process.get().unwrap().lock().await.stdin = Box::new(tokio::io::sink());
+        if let Some(process) = provider.cli_processes.lock().await.get("test-session").cloned() {
+            process.lock().await.stdin = Box::new(tokio::io::sink());
+        }
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
         String::from_utf8(buf).unwrap()
@@ -1449,7 +1512,11 @@ mod tests {
         let (process, stdin_reader) = make_test_process(&canned_stdout);
         let provider = make_provider();
         let process_arc = Arc::new(tokio::sync::Mutex::new(process));
-        provider.cli_process.set(process_arc).unwrap();
+        provider
+            .cli_processes
+            .lock()
+            .await
+            .insert("test-session".to_string(), process_arc);
 
         let (tx, _rx) = oneshot::channel();
         provider
